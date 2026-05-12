@@ -5,25 +5,25 @@ from langchain_community.vectorstores import Chroma
 import dashscope
 from dashscope import TextEmbedding
 import os
-import sys
 import warnings
+import gradio as gr
 
-# 忽略所有警告，运行时干干净净
+# 忽略所有警告
 warnings.filterwarnings("ignore")
 
 # ===================== 配置区（只改这里！）=====================
-API_KEY = "sk-da6ab4fb9490463a8c1e32617b0e2a5c"
-DOCS_FOLDER = "./docs"  # 所有PDF文档都放在这个文件夹里
-VECTOR_DB_PATH = "./chroma_db"  # 向量库本地保存路径
+API_KEY = "你自己的sk-开头的API Key"  # 改成占位符，避免泄露密钥
+DOCS_FOLDER = "./docs"
+VECTOR_DB_PATH = "./chroma_db"
 # ==============================================================
 
-# 配置通义千问API，强制关闭代理解决网络问题
+# 配置通义千问不走代理
 dashscope.api_key = API_KEY
 os.environ["NO_PROXY"] = "dashscope.aliyuncs.com"
 os.environ["no_proxy"] = "dashscope.aliyuncs.com"
 
 
-# 自定义通义千问嵌入模型
+# 自定义嵌入模型
 class QwenEmbeddings:
     def embed_documents(self, texts):
         resp = TextEmbedding.call(
@@ -36,102 +36,136 @@ class QwenEmbeddings:
         return self.embed_documents([text])[0]
 
 
-# 流式输出打字机效果
-def stream_print(response):
-    print("\n回答：", end="", flush=True)
-    for chunk in response:
-        if chunk.content:
-            print(chunk.content, end="", flush=True)
-    print("\n" + "-" * 60)
+# 提取引用来源
+def get_source_files(docs):
+    sources = []
+    for doc in docs:
+        file_name = os.path.basename(doc.metadata.get("source", "未知文档"))
+        if file_name not in sources:
+            sources.append(file_name)
+    return sources
 
 
-def main():
-    embeddings = QwenEmbeddings()
+# 全局初始化
+embeddings = QwenEmbeddings()
+retriever = None
+llm = None
 
-    # 向量库持久化：存在就加载，不存在就创建
+
+# 初始化知识库
+def init_knowledge_base():
+    global retriever, llm
     if os.path.exists(VECTOR_DB_PATH):
-        print("检测到已存在的向量库，正在加载...")
+        print("检测到已存在向量库，正在加载...")
         db = Chroma(
             persist_directory=VECTOR_DB_PATH,
             embedding_function=embeddings
         )
     else:
-        print("未检测到向量库，正在加载docs文件夹中的所有PDF文档...")
-
-        # 自动创建docs文件夹（如果不存在）
+        print("未检测到向量库，正在加载docs文件夹所有PDF...")
         if not os.path.exists(DOCS_FOLDER):
             os.makedirs(DOCS_FOLDER)
-            print(f"✅ 已自动创建 {DOCS_FOLDER} 文件夹")
-            print("请将需要问答的PDF文件放入该文件夹后重新运行程序")
-            return
+            print(f"已自动创建 {DOCS_FOLDER}，请放入PDF后重启程序")
+            return False
 
-        # 加载文件夹中所有PDF文件（包括子文件夹）
         loader = DirectoryLoader(
             DOCS_FOLDER,
-            glob="**/*.pdf",  # 匹配所有.pdf后缀的文件
+            glob="**/*.pdf",
             loader_cls=PyPDFLoader,
-            show_progress=True  # 显示加载进度条
+            show_progress=True
         )
         docs = loader.load()
 
-        # 文本智能分割
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=500,
             chunk_overlap=50,
             separators=["\n\n", "\n", "。", "，", " ", ""]
         )
         splits = text_splitter.split_documents(docs)
-        print(f"\n✅ 文档加载完成，共 {len(docs)} 个PDF，分割为 {len(splits)} 个文本块")
+        print(f"\n文档加载完成：共{len(docs)}个PDF，分割为{len(splits)}个文本块")
 
-        # 生成向量并构建知识库
-        print("正在生成向量并构建知识库...")
+        print("正在生成向量知识库...")
         db = Chroma.from_documents(
             splits,
             embeddings,
             persist_directory=VECTOR_DB_PATH
         )
-        print("✅ 向量库已自动保存到本地")
+        print("向量库保存完成！")
 
     retriever = db.as_retriever(search_kwargs={"k": 3})
-
-    # 初始化大模型
     llm = ChatOpenAI(
         model="qwen-turbo",
         temperature=0.1,
         api_key=API_KEY,
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        streaming=True
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
     )
+    return True
 
-    print("\n" + "=" * 50)
-    print("===== 本地多文档智能问答机器人已启动 =====")
-    print("输入问题即可提问，输入 exit 退出程序")
-    print("=" * 50 + "\n")
 
-    while True:
-        question = input("请输入问题：")
-        if question.lower() == "exit":
-            print("程序已退出")
-            break
+# ✅ 适配新版Gradio的对话逻辑（核心修复）
+def chat_response(message, chat_history):
+    if not message.strip():
+        return "", chat_history
 
-        # 检索相关文档
-        relevant_docs = retriever.invoke(question)
-        context = "\n".join([doc.page_content for doc in relevant_docs])
+    # 1. 检索文档并获取来源
+    relevant_docs = retriever.invoke(message)
+    context = "\n".join([d.page_content for d in relevant_docs])
+    source_list = get_source_files(relevant_docs)
+    source_text = "📚 引用来源：" + "、".join(source_list)
 
-        # 生成回答并流式输出
-        prompt = f"""
-        请严格根据以下提供的上下文内容回答问题，不要编造任何上下文以外的信息。
-        如果上下文中没有相关信息，请直接回答"抱歉，我在文档中没有找到相关内容"。
+    # 2. 拼接历史对话（适配新版格式）
+    history_text = ""
+    for msg in chat_history:
+        role = msg["role"]
+        content = msg["content"]
+        history_text += f"{role}：{content}\n"
 
-        上下文：
-        {context}
+    # 3. 构造提示词
+    prompt = f"""
+你是本地PDF智能问答助手，严格只根据上下文回答，不许编造。
+若无相关内容，直接回复：抱歉，我在文档中没有找到相关内容。
 
-        问题：{question}
-        """
+【历史对话】
+{history_text}
+【参考上下文】
+{context}
+【用户问题】
+{message}
+"""
+    # 4. 获取回答
+    res = llm.invoke(prompt)
+    reply = res.content + "\n\n" + source_text
 
-        response = llm.stream(prompt)
-        stream_print(response)
+    # 5. 按新版格式更新对话历史
+    chat_history.append({"role": "user", "content": message})
+    chat_history.append({"role": "assistant", "content": reply})
+
+    return "", chat_history
+
+
+# 清空对话
+def clear_chat():
+    return []
+
+
+# 创建网页界面
+def create_web_ui():
+    with gr.Blocks(title="本地PDF智能问答系统") as demo:
+        gr.Markdown("# 📖 本地多PDF文档智能问答")
+        gr.Markdown("自动加载docs文件夹PDF | 多轮对话 | 显示引用来源")
+
+        # ✅ 新版Chatbot，默认支持字典格式
+        chatbot = gr.Chatbot(height=500)
+        msg = gr.Textbox(placeholder="输入你的问题...")
+        clear = gr.Button("清空对话")
+
+        # 绑定交互事件
+        msg.submit(chat_response, [msg, chatbot], [msg, chatbot])
+        clear.click(clear_chat, [], chatbot)
+
+    demo.launch(inbrowser=True)
 
 
 if __name__ == "__main__":
-    main()
+    if init_knowledge_base():
+        create_web_ui()

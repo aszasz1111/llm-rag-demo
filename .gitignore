@@ -18,4 +18,4 @@ __pycache__/
 *.env
 .idea/
 # PDF文档（可选，不想上传文档就加上）
-# *.pdf
+#*.pdf
